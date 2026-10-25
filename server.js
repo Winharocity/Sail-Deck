@@ -72,6 +72,21 @@ function tx(fn) {
   try { const r = fn(); db.exec('COMMIT'); return r; } catch (e) { db.exec('ROLLBACK'); throw e; }
 }
 
+/* ---------- schema migrations (safe to run on every start) ---------- */
+function addColumn(table, col, def) {
+  if (!q(`PRAGMA table_info(${table})`).some(c => c.name === col)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${col} ${def}`);
+}
+addColumn('bookings', 'source', "TEXT NOT NULL DEFAULT 'local'");
+addColumn('bookings', 'external_id', 'TEXT');
+addColumn('bookings', 'external_item', 'TEXT');
+addColumn('bookings', 'boat_class', 'TEXT');
+db.exec(`
+CREATE UNIQUE INDEX IF NOT EXISTS idx_bookings_ext ON bookings(source, external_id) WHERE external_id IS NOT NULL;
+CREATE TABLE IF NOT EXISTS item_map (
+  item_key TEXT PRIMARY KEY, item_label TEXT NOT NULL,
+  boat_id INTEGER REFERENCES boats(id) ON DELETE CASCADE, boat_class TEXT);
+`);
+
 function hashPassword(pw) {
   const salt = crypto.randomBytes(16).toString('hex');
   return salt + ':' + crypto.scryptSync(pw, salt, 64).toString('hex');
@@ -179,6 +194,162 @@ function bookingConflict(b, ignoreId) {
              AND start < ? AND end > ?`, b.boat_id, ignoreId || 0, b.end, b.start);
 }
 
+/* ---------- website bookings feed (read-only import from another site) ---------- */
+let EXT_URL = process.env.EXTERNAL_BOOKINGS_URL || '';
+const EXT_TOKEN = process.env.EXTERNAL_BOOKINGS_TOKEN || '';
+const EXT_MINUTES = Math.max(1, Number(process.env.EXTERNAL_SYNC_MINUTES) || 5);
+let EXT_HOST = '';
+if (EXT_URL) {
+  try {
+    const u = new URL(EXT_URL);
+    if (!/^https?:$/.test(u.protocol)) throw new Error('not http(s)');
+    EXT_HOST = u.host;
+  } catch { console.warn('EXTERNAL_BOOKINGS_URL is not a valid http(s) URL; website feed disabled'); EXT_URL = ''; }
+}
+let FIELD_MAP = {};
+try { if (process.env.EXTERNAL_FIELD_MAP) FIELD_MAP = JSON.parse(process.env.EXTERNAL_FIELD_MAP); }
+catch { console.warn('EXTERNAL_FIELD_MAP is not valid JSON; ignoring it'); }
+// Where to look for each field in a feed row. Override any with EXTERNAL_FIELD_MAP, e.g. {"id":"booking_id","title":"customer.name"}
+const FIELD_CANDIDATES = {
+  id: ['id', 'booking_id', 'bookingId', 'code', 'booking_code', 'ref', 'reference'],
+  title: ['title', 'name', 'customer_name', 'customer', 'summary', 'description'],
+  item: ['item', 'item_name', 'boat', 'resource', 'product', 'sku', 'equipment'],
+  start: ['start', 'start_date', 'startDate', 'from', 'begin', 'start_time'],
+  end: ['end', 'end_date', 'endDate', 'to', 'finish', 'end_time'],
+  status: ['status', 'state', 'status_name'],
+};
+const CANCEL_RE = /^(canc|void|decl|stop|del|refund|expire|reject|no.?show|abandon)/i;
+const getPath = (o, p) => String(p).split('.').reduce((v, k) => (v == null ? undefined : v[k]), o);
+function pick(row, field) {
+  const paths = FIELD_MAP[field] ? [FIELD_MAP[field]] : FIELD_CANDIDATES[field];
+  for (const p of paths) {
+    let v = getPath(row, p);
+    if (Array.isArray(v)) continue;
+    if (v && typeof v === 'object') v = v.name ?? v.title ?? v.code ?? v.id;
+    if (v !== undefined && v !== null && String(v).trim() !== '') return v;
+  }
+  return null;
+}
+function parseWhen(v, isEnd) {
+  if (v == null) return null;
+  if (typeof v === 'number' || /^\d{9,13}$/.test(String(v))) { const n = Number(v); return new Date(n < 1e12 ? n * 1000 : n).toISOString(); }
+  const s = String(v).trim();
+  const dateOnly = /^\d{4}-\d{2}-\d{2}$/.test(s);
+  const ms = Date.parse(dateOnly ? s + 'T00:00:00' : s); // no timezone in the text = container TZ
+  if (Number.isNaN(ms)) return null;
+  return new Date(dateOnly && isEnd ? ms + 864e5 : ms).toISOString(); // date-only end = end of that day
+}
+function resolveTarget(item) {
+  if (!item) return { boat_id: null, boat_class: null };
+  const key = String(item).trim().toLowerCase();
+  const m = q1('SELECT boat_id, boat_class FROM item_map WHERE item_key=?', key);
+  if (m) return { boat_id: m.boat_id, boat_class: m.boat_class };
+  const boat = q1('SELECT id FROM boats WHERE lower(name)=? OR lower(sail_no)=?', key, key);
+  return { boat_id: boat ? boat.id : null, boat_class: null };
+}
+
+const ext = { ok: null, error: null, lastRun: null, total: 0, imported: 0, updated: 0, cancelled: 0, skipped: 0 };
+let extRunning = false, lastManualSync = 0;
+
+function applyFeed(rows) {
+  const st = { imported: 0, updated: 0, cancelled: 0, skipped: 0 };
+  const seen = new Set();
+  tx(() => {
+    for (const r of rows) {
+      if (!r || typeof r !== 'object') { st.skipped++; continue; }
+      const id = pick(r, 'id');
+      const start = parseWhen(pick(r, 'start'), false), end = parseWhen(pick(r, 'end'), true);
+      if (id == null || !start || !end || end <= start) { st.skipped++; continue; }
+      const extId = String(id).trim().slice(0, 100);
+      const itemRaw = pick(r, 'item');
+      const item = itemRaw == null ? null : String(itemRaw).trim().slice(0, 200);
+      const title = String(pick(r, 'title') ?? item ?? `Booking ${extId}`).trim().slice(0, 200);
+      const status = CANCEL_RE.test(String(pick(r, 'status') ?? '').trim()) ? 'cancelled' : 'confirmed';
+      const t = resolveTarget(item);
+      seen.add(extId);
+      const cur = q1("SELECT * FROM bookings WHERE source='external' AND external_id=?", extId);
+      if (cur) {
+        const next = { title, start, end, status, boat_id: t.boat_id, boat_class: t.boat_class, external_item: item };
+        if (Object.keys(next).some(k => (cur[k] ?? null) !== (next[k] ?? null))) {
+          run('UPDATE bookings SET title=?, start=?, end=?, status=?, boat_id=?, boat_class=?, external_item=? WHERE id=?',
+            title, start, end, status, t.boat_id, t.boat_class, item, cur.id);
+          st.updated++;
+        }
+      } else {
+        run(`INSERT INTO bookings(title,kind,start,end,status,boat_id,boat_class,created_at,source,external_id,external_item)
+             VALUES (?,?,?,?,?,?,?,?,'external',?,?)`, title, 'other', start, end, status, t.boat_id, t.boat_class, now(), extId, item);
+        st.imported++;
+      }
+    }
+    // A future booking that vanished from a non-empty feed was cancelled/removed on the website.
+    if (seen.size) {
+      for (const b of q("SELECT id, external_id FROM bookings WHERE source='external' AND status='confirmed' AND start > ?", now()))
+        if (!seen.has(b.external_id)) { run("UPDATE bookings SET status='cancelled' WHERE id=?", b.id); st.cancelled++; }
+    }
+  });
+  return st;
+}
+
+async function syncExternal() {
+  if (!EXT_URL || extRunning) return;
+  extRunning = true;
+  try {
+    const res = await fetch(EXT_URL, {
+      headers: { Accept: 'application/json', ...(EXT_TOKEN ? { Authorization: `Bearer ${EXT_TOKEN}` } : {}) },
+      signal: AbortSignal.timeout(15000),
+    });
+    if (!res.ok) throw new Error(`Feed returned HTTP ${res.status}`);
+    const text = await res.text();
+    if (text.length > 5e6) throw new Error('Feed is larger than 5 MB');
+    let data; try { data = JSON.parse(text); } catch { throw new Error('Feed is not valid JSON'); }
+    const rows = Array.isArray(data) ? data : ['bookings', 'data', 'results', 'items'].map(k => data && data[k]).find(Array.isArray);
+    if (!rows) throw new Error('Feed JSON has no list of bookings (expected an array, or {"bookings":[...]})');
+    Object.assign(ext, applyFeed(rows), { ok: true, error: null, total: rows.length, lastRun: now() });
+  } catch (e) {
+    Object.assign(ext, { ok: false, error: e.name === 'TimeoutError' ? 'Feed timed out after 15s' : (e.cause && e.cause.code) ? `Cannot reach feed (${e.cause.code})` : e.message, lastRun: now() });
+  } finally { extRunning = false; }
+}
+
+function externalStatus() {
+  if (!EXT_URL) return { configured: false };
+  return {
+    configured: true, host: EXT_HOST, minutes: EXT_MINUTES, ...ext,
+    unmapped: q(`SELECT external_item AS item, COUNT(*) AS count FROM bookings
+                 WHERE source='external' AND boat_id IS NULL AND boat_class IS NULL AND external_item IS NOT NULL
+                 AND status='confirmed' AND end > ? GROUP BY lower(external_item) ORDER BY count DESC`, now()),
+    mappings: q(`SELECT m.item_key, m.item_label, m.boat_id, m.boat_class, b.name AS boat_name
+                 FROM item_map m LEFT JOIN boats b ON b.id=m.boat_id ORDER BY m.item_label`),
+  };
+}
+
+// Overlaps on a specific boat, plus pooled ("any RS Quest") bookings that exceed the boats available in that class.
+function findClashes() {
+  const horizon = new Date(Date.now() + 60 * 864e5).toISOString();
+  const rows = q(`SELECT k.id, k.title, k.start, k.end, k.boat_id, k.boat_class, b.name AS boat_name FROM bookings k
+                  LEFT JOIN boats b ON b.id=k.boat_id WHERE k.status='confirmed' AND k.end > ? AND k.start < ? ORDER BY k.start`, now(), horizon);
+  const out = [], byBoat = new Map(), pools = new Map();
+  for (const r of rows) {
+    if (r.boat_id) { if (!byBoat.has(r.boat_id)) byBoat.set(r.boat_id, []); byBoat.get(r.boat_id).push(r); }
+    else if (r.boat_class) { const k = r.boat_class.toLowerCase(); if (!pools.has(k)) pools.set(k, { name: r.boat_class, list: [] }); pools.get(k).list.push(r); }
+  }
+  for (const list of byBoat.values())
+    for (let i = 0; i < list.length; i++)
+      for (let j = i + 1; j < list.length && list[j].start < list[i].end; j++)
+        out.push({ type: 'boat', label: list[i].boat_name, a: list[i].title, b: list[j].title, when: list[j].start });
+  for (const p of pools.values()) {
+    const cap = q1("SELECT COUNT(*) c FROM boats WHERE lower(class)=? AND status NOT IN ('out_of_service','maintenance')", p.name.toLowerCase()).c;
+    const ev = [];
+    for (const r of p.list) ev.push([r.start, 1], [r.end, -1]);
+    ev.sort((x, y) => (x[0] < y[0] ? -1 : x[0] > y[0] ? 1 : x[1] - y[1]));
+    let cur = 0;
+    for (const [at, d] of ev) {
+      cur += d;
+      if (d === 1 && cur > cap) { out.push({ type: 'pool', label: p.name, a: `${cur} bookings at once`, b: `only ${cap} boat${cap === 1 ? '' : 's'} available`, when: at }); break; }
+    }
+  }
+  return out.sort((x, y) => x.when.localeCompare(y.when)).slice(0, 10);
+}
+
 /* ---------- API handlers ---------- */
 function latestConditions() { return q1('SELECT * FROM conditions ORDER BY recorded_at DESC LIMIT 1'); }
 
@@ -213,6 +384,7 @@ function dashboard() {
                     WHERE d.resolved_at IS NULL ORDER BY CASE d.severity WHEN 'critical' THEN 0 WHEN 'major' THEN 1 ELSE 2 END LIMIT 20`),
     upcoming,
     expiring,
+    clashes: findClashes(),
     incidents30: q1("SELECT COUNT(*) c FROM incidents WHERE occurred_at > ?", new Date(Date.now() - 30 * 864e5).toISOString()).c,
     openIncidents: q1("SELECT COUNT(*) c FROM incidents WHERE status!='closed'").c,
   };
@@ -317,6 +489,7 @@ function genericUpdate(name) {
   return ctx => {
     const existing = q1(`SELECT * FROM ${name} WHERE id=?`, ctx.params.id);
     if (!existing) throw new HttpError(404, 'Not found');
+    if (name === 'bookings' && existing.source === 'external') throw new HttpError(409, 'This booking comes from the website feed. Change it on the website.');
     const row = clean(name, ctx.body, true);
     if (name === 'bookings') {
       const merged = { ...existing, ...row };
@@ -338,6 +511,8 @@ function genericUpdate(name) {
 }
 function genericDelete(name) {
   return ctx => {
+    if (name === 'bookings' && q1("SELECT 1 x FROM bookings WHERE id=? AND source='external'", ctx.params.id))
+      throw new HttpError(409, 'This booking comes from the website feed. Cancel or remove it on the website.');
     if (name === 'boats' && q1('SELECT COUNT(*) c FROM signouts WHERE boat_id=?', ctx.params.id).c)
       throw new HttpError(409, 'Boat has sign-out history. Set it to "maintenance" instead of deleting.');
     const r = run(`DELETE FROM ${name} WHERE id=?`, ctx.params.id);
@@ -372,6 +547,41 @@ route('POST', '/api/defects/:id/resolve', resolveDefect);
 route('DELETE', '/api/defects/:id', genericDelete('defects'), { admin: true });
 route('POST', '/api/signouts', signOut);
 route('POST', '/api/signouts/:id/signin', signIn);
+
+route('GET', '/api/external/status', () => externalStatus());
+route('POST', '/api/external/sync', async () => {
+  if (!EXT_URL) throw new HttpError(400, 'No website feed is configured');
+  if (Date.now() - lastManualSync > 5000) { lastManualSync = Date.now(); await syncExternal(); }
+  return externalStatus();
+});
+// Link a website item name to one specific boat ("b:<id>"), to any boat of a class ("c:<class>"), or unlink ("").
+route('POST', '/api/external/map', ctx => {
+  const item = String(ctx.body.item || '').trim();
+  const target = String(ctx.body.target || '');
+  if (!item) throw new HttpError(400, 'Item is required');
+  const key = item.toLowerCase();
+  tx(() => {
+    if (!target) run('DELETE FROM item_map WHERE item_key=?', key);
+    else {
+      let boatId = null, boatClass = null;
+      if (target.startsWith('b:')) {
+        boatId = Number(target.slice(2));
+        if (!q1('SELECT id FROM boats WHERE id=?', boatId)) throw new HttpError(404, 'Boat not found');
+      } else if (target.startsWith('c:')) {
+        const hit = q1('SELECT class FROM boats WHERE lower(class)=? LIMIT 1', target.slice(2).toLowerCase());
+        if (!hit) throw new HttpError(404, 'No boats of that class');
+        boatClass = hit.class;
+      } else throw new HttpError(400, 'Invalid target');
+      run(`INSERT INTO item_map(item_key,item_label,boat_id,boat_class) VALUES (?,?,?,?)
+           ON CONFLICT(item_key) DO UPDATE SET item_label=excluded.item_label, boat_id=excluded.boat_id, boat_class=excluded.boat_class`,
+        key, item, boatId, boatClass);
+    }
+    const t = resolveTarget(item);
+    run("UPDATE bookings SET boat_id=?, boat_class=? WHERE source='external' AND lower(external_item)=?", t.boat_id, t.boat_class, key);
+    audit(ctx.user, 'map_item', 'item_map', null);
+  });
+  return externalStatus();
+}, { admin: true });
 
 route('GET', '/api/audit', () => q('SELECT * FROM audit ORDER BY id DESC LIMIT 200'), { admin: true });
 route('GET', '/api/users', () => q('SELECT id,username,name,role,created_at FROM users ORDER BY username'), { admin: true });
@@ -532,4 +742,10 @@ const server = http.createServer(async (req, res) => {
 });
 
 server.listen(PORT, '0.0.0.0', () => console.log(`SailDeck listening on :${PORT} (data in ${DATA_DIR})`));
+if (EXT_URL) {
+  const report = () => console.log(ext.ok ? `Website feed OK: ${ext.total} in feed, ${ext.imported} new, ${ext.updated} changed, ${ext.cancelled} cancelled, ${ext.skipped} skipped` : `Website feed FAILED: ${ext.error}`);
+  syncExternal().then(report);
+  setInterval(() => syncExternal().then(() => { if (!ext.ok) report(); }), EXT_MINUTES * 60e3);
+  console.log(`Website feed enabled: ${EXT_HOST}, every ${EXT_MINUTES} min`);
+}
 for (const sig of ['SIGTERM', 'SIGINT']) process.on(sig, () => { server.close(); try { db.close(); } catch {} process.exit(0); });
