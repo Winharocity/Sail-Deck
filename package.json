@@ -1,0 +1,10 @@
+{
+  "name": "saildeck",
+  "version": "1.0.0",
+  "description": "Self-hosted sailing centre manager: safety board, fleet, bookings, people, incidents.",
+  "main": "server.js",
+  "scripts": { "start": "node --disable-warning=ExperimentalWarning server.js" },
+  "engines": { "node": ">=22.13" },
+  "license": "MIT",
+  "private": true
+}

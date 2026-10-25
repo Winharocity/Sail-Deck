@@ -1,0 +1,27 @@
+# SailDeck - Portainer stack
+# Paste into Portainer > Stacks > Add stack (see README for the two ways to get the image).
+services:
+  saildeck:
+    image: saildeck:latest          # change to your registry path if you push the image
+    build: .                        # used when deploying from a Git repository
+    container_name: saildeck
+    restart: unless-stopped
+    ports:
+      - "${SAILDECK_PORT:-3000}:3000"
+    environment:
+      TZ: ${TZ:-UTC}                                  # e.g. Australia/Brisbane
+      CENTRE_NAME: ${CENTRE_NAME:-Harbour Sailing Centre}
+      # Only used the first time the app starts, to create the "admin" login.
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:?Set ADMIN_PASSWORD in the stack environment variables}
+      SEED_DEMO: ${SEED_DEMO:-false}                  # true = load sample boats/people on first start
+    volumes:
+      - saildeck-data:/data
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  saildeck-data:
