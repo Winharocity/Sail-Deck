@@ -1,2 +1,0 @@
-# Sail-Deck
-sail os
