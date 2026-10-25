@@ -4,6 +4,7 @@ services:
   saildeck:
     image: saildeck:latest          # change to your registry path if you push the image
     build: .                        # used when deploying from a Git repository
+    pull_policy: build
     container_name: saildeck
     restart: unless-stopped
     ports:
