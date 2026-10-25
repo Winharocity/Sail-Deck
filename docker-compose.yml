@@ -1,10 +1,9 @@
 # SailDeck - Portainer stack
-# Paste into Portainer > Stacks > Add stack (see README for the two ways to get the image).
+# Deploy from a Git repository (Stacks > Add stack > Repository). The image is built on your server.
 services:
   saildeck:
-    image: saildeck:latest          # change to your registry path if you push the image
-    build: .                        # used when deploying from a Git repository
-    pull_policy: build
+    build: .
+    pull_policy: build              # build locally; never try to pull "saildeck" from Docker Hub
     container_name: saildeck
     restart: unless-stopped
     ports:
@@ -15,8 +14,16 @@ services:
       # Only used the first time the app starts, to create the "admin" login.
       ADMIN_PASSWORD: ${ADMIN_PASSWORD:?Set ADMIN_PASSWORD in the stack environment variables}
       SEED_DEMO: ${SEED_DEMO:-false}                  # true = load sample boats/people on first start
+      # --- Optional: import bookings from your website's JSON feed (read-only) ---
+      EXTERNAL_BOOKINGS_URL: ${EXTERNAL_BOOKINGS_URL:-}      # e.g. http://bookings-site:8080/api/bookings.json
+      EXTERNAL_BOOKINGS_TOKEN: ${EXTERNAL_BOOKINGS_TOKEN:-}  # sent as "Authorization: Bearer ..." if set
+      EXTERNAL_SYNC_MINUTES: ${EXTERNAL_SYNC_MINUTES:-5}
+      EXTERNAL_FIELD_MAP: ${EXTERNAL_FIELD_MAP:-}            # optional JSON, e.g. {"id":"booking_id","item":"product.name"}
     volumes:
       - saildeck-data:/data
+    networks:
+      - default
+      - bookings-link                                 # shared network so SailDeck can reach your website stack
     healthcheck:
       test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
       interval: 30s
@@ -26,3 +33,8 @@ services:
 
 volumes:
   saildeck-data:
+
+networks:
+  bookings-link:
+    name: bookings-link
+    driver: bridge
